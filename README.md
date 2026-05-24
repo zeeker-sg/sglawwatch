@@ -1,5 +1,5 @@
 # Sglawwatch-Zeeker Database Project
-[![Sync Headlines Database](https://github.com/houfu/sglawwatch-zeeker/actions/workflows/sync-headlines.yml/badge.svg)](https://github.com/houfu/sglawwatch-zeeker/actions/workflows/sync-headlines.yml)
+[![Sync Headlines Database](https://github.com/zeeker-sg/sglawwatch/actions/workflows/sync-headlines.yml/badge.svg)](https://github.com/zeeker-sg/sglawwatch/actions/workflows/sync-headlines.yml)
 
 
 A Zeeker project for managing the sglawwatch-zeeker database.

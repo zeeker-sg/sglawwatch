@@ -3,9 +3,12 @@ Headlines resource for fetching Singapore Law Watch Headlines RSS feed.
 """
 
 import asyncio
+import json
 import os
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import Dict, Optional
+
+TOKEN_LOG_PATH = os.path.expanduser("~/.config/zeeker/token_usage.jsonl")
 
 import click
 import feedparser
@@ -28,6 +31,26 @@ def _get_llm_semaphore() -> asyncio.Semaphore:
     if _LLM_SEMAPHORE is None:
         _LLM_SEMAPHORE = asyncio.Semaphore(3)
     return _LLM_SEMAPHORE
+
+
+def _log_token_usage(*, endpoint: str, model: str, prompt_tokens: int | None, completion_tokens: int | None, call_type: str = "summary") -> None:
+    """Write token usage to shared JSONL log."""
+    record = {
+        "ts": datetime.now(timezone.utc).isoformat(),
+        "agent": "sglawwatch-zeeker",
+        "endpoint": endpoint,
+        "model": model,
+        "prompt_tokens": prompt_tokens or 0,
+        "completion_tokens": completion_tokens or 0,
+        "call_type": call_type,
+    }
+    try:
+        os.makedirs(os.path.dirname(TOKEN_LOG_PATH), exist_ok=True)
+        with open(TOKEN_LOG_PATH, "a") as fh:
+            fh.write(json.dumps(record, default=str) + "\n")
+    except Exception:
+        pass
+
 
 SYSTEM_PROMPT_TEXT = """
 As an expert in legal affairs, your task is to provide summaries of legal news articles for time-constrained attorneys in an engaging, conversational style. These summaries should highlight the critical legal aspects, relevant precedents, and implications of the issues discussed in the articles. The summary should be in 1 narrative paragraph and should not be longer than 100 words, but ensure they efficiently deliver the key legal insights, making them beneficial for quick comprehension. The end goal is to help the lawyers understand the crux of the articles without having to read them in their entirety.
@@ -100,6 +123,16 @@ async def get_summary(text: str) -> str:
                     {"role": "user", "content": f"Here is an article to summarise:\n {text[:4000]}"},
                 ],
             )
+        try:
+            _log_token_usage(
+                endpoint=base_url,
+                model=model,
+                prompt_tokens=getattr(response.usage, "prompt_tokens", None),
+                completion_tokens=getattr(response.usage, "completion_tokens", None),
+                call_type="summary",
+            )
+        except Exception:
+            pass
         content = response.choices[0].message.content
         if not content:
             finish_reason = response.choices[0].finish_reason
