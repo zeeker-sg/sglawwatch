@@ -8,7 +8,9 @@ import os
 from datetime import datetime, timezone
 from typing import Dict, Optional
 
-TOKEN_LOG_PATH = os.path.expanduser("~/.config/zeeker/token_usage.jsonl")
+TOKEN_LOG_PATH = os.environ.get(
+    "ZEEKER_TOKEN_LOG", "/workspace/agent/token_usage.jsonl"
+)
 
 import click
 import feedparser
