@@ -2,14 +2,14 @@
 name = "Singapore Law Watch"
 database = "sglawwatch.db"
 title = "SG LawWatch"
-description = "Singapore legal news and reference articles from Singapore LawWatch, the Singapore Academy of Law's daily legal news syndication site."
-license = "CC-BY-4.0"
-license_url = "https://creativecommons.org/licenses/by/4.0/"
-source = "Singapore LawWatch"
+description = "Non-commercial catalogue of Singapore legal news and reference content from the RSS feeds and public pages of Singapore Law Watch (https://www.singaporelawwatch.sg), a free daily legal news service of the Singapore Academy of Law (SAL): daily headlines with AI-generated summaries and links to the original articles, an index of law firm commentaries, and an index of the About Singapore Law reference chapters. This project is independent and is not affiliated with, or endorsed by, SAL, Singapore Law Watch, or any publisher. Copyright in the underlying articles belongs to the original publishers. AI-generated summaries are produced by this project, not by SLW or the publishers, and may contain errors. Check Singapore Law Watch and the original publishers for the authoritative versions of all content."
+license = "Copyright in news articles belongs to the original publishers; copyright in commentaries belongs to their contributing firms and authors; copyright in the About Singapore Law chapters and other site content belongs to the Singapore Academy of Law and its licensors. Not openly licensed."
+license_url = "https://www.singaporelawwatch.sg/Terms"
+source = "Singapore Law Watch (https://www.singaporelawwatch.sg)"
 source_url = "https://www.singaporelawwatch.sg/"
 
 [resource.headlines]
-description = "Legal news headlines with AI-generated summaries, collated from The Straits Times, The Business Times, Lianhe Zaobao, TODAY, and other sources."
+description = "Daily legal news headlines from the Singapore Law Watch Headlines RSS feed: title, link, publication metadata, full article text, and an AI-generated ~100-word summary per article. Append-only; entries more than 60 days old at ingest time, advertisement entries ('ADV:' titles), and already-seen IDs are skipped. The underlying articles are copyright their original publishers (e.g. The Straits Times, The Business Times, Lianhe Zaobao) — follow source_link for the original text."
 sort_desc = "date"
 label_column = "title"
 facets = ["category"]
@@ -17,18 +17,18 @@ size = 20
 fts_fields = ["title", "summary"]
 
 [resource.headlines.columns]
-id = "Unique hash identifier for the headline record"
-category = "News source publication (e.g., Straits Times, Business Times, Lianhe Zaobao, MinLaw)"
-title = "Headline title of the news article"
-source_link = "URL link to the original article on Singapore LawWatch"
-author = "Author of the news article, prefixed with publication name"
-date = "Publication date of the article in ISO 8601 format"
-summary = "AI-generated summary of the article content"
-text = "Full extracted text content of the news article"
-imported_on = "Timestamp when the record was imported into the database"
+id = "Opaque MD5 hash of '{date}|{title}' (full 32 hex chars) — deterministic dedup key computed at ingest. RSS GUIDs are ignored because the feed's own IDs are often empty or inconsistent."
+category = "RSS category field verbatim — in practice the carrying publication or source, e.g. 'Straits Times', 'Business Times'. Empty string when the feed omits it. The set of values follows whatever the live feed carries."
+title = "Headline title exactly as carried in the RSS feed. Advertisement entries (titles starting 'ADV:') never reach this table."
+source_link = "RSS entry link verbatim. Frequently points to the external publisher's own site (e.g. straitstimes.com, businesstimes.com.sg) or other destinations such as store.lawnet.com — not necessarily a Singapore Law Watch page."
+author = "RSS author field verbatim, exactly as the feed supplies it (often, but not always, in the feed's 'Publication: Author' style — no formatting is enforced by the pipeline). Empty string when missing."
+date = "Publication timestamp from the RSS 'published' field, converted to ISO 8601 (e.g. '2025-05-08T00:01:00'). Falls back to the ingest timestamp if the feed date cannot be parsed."
+summary = "AI-generated summary (~100 words, single narrative paragraph aimed at time-constrained lawyers), produced by this project from the first 4,000 characters of text. When the LLM call fails, a non-AI fallback string 'Legal news article: {title}...' is stored instead; empty summaries are backfilled on later runs from a plain HTTP fetch of the article. Not authoritative — may contain errors."
+text = "Full article text extracted via Jina Reader. When extraction fails or the URL matches known-problematic patterns (store.lawnet.com, links with utm_source= tracking parameters), a placeholder is stored instead: 'Article: {title} / Source: {url} / Content could not be retrieved from source.' May be an empty string for rows ingested while the Jina API token was unset. Copyright in this text remains with the original publisher."
+imported_on = "ISO 8601 timestamp when the row was ingested into the database."
 
 [resource.about_singapore_law]
-description = "Reference articles from the About Singapore Law section, covering legal topics and guides for the public."
+description = "Catalog of 'About Singapore Law' reference chapters — academic overview chapters on Singapore law published on Singapore Law Watch, discovered from the Overview, Commercial Law, and Singapore Legal System section pages. One row per chapter; the chapter text itself lives in about_singapore_law_fragments. Chapters carry academic author bylines on the source pages and are copyright the Singapore Academy of Law and their credited authors."
 label_column = "title"
 facets = ["section"]
 fragments = true
@@ -36,16 +36,27 @@ fts_fields = ["title"]
 fragments_fts_fields = ["content_text"]
 
 [resource.about_singapore_law.columns]
-id = "Unique hash identifier for the article"
-item_url = "URL of the article on Singapore LawWatch"
-title = "Title of the reference article"
-section = "Topical section the article belongs to (e.g., Criminal Law, Family Law)"
-home_page = "URL of the section home page"
-last_scraped = "Timestamp of the last successful scrape"
-content_length = "Character count of the full article text"
+id = "Opaque MD5 hash of the chapter URL (first 12 hex chars). about_singapore_law_fragments.item_id points here."
+item_url = "URL of the chapter page."
+title = "Chapter title — the link text as it appears on the section page, e.g. 'Ch. 01 The Singapore Legal System'."
+section = "Name of the section page the chapter was discovered from: 'Overview', 'Commercial Law', or 'Singapore Legal System' — the only three sections the pipeline crawls."
+home_page = "Duplicate of section: the code stores the section NAME here, not a URL. Vestigial column kept for schema stability — prefer section."
+last_scraped = "Local timestamp ('YYYY-MM-DD HH:MM:SS') when the chapter link was last discovered on its section page. Records discovery time, not the content-scrape time."
+content_length = "Always 0 — set at discovery and never updated by any code path. Do not use; per-fragment sizes live in about_singapore_law_fragments.char_count."
+
+[resource.about_singapore_law_fragments]
+description = "Searchable content chunks of each About Singapore Law chapter, scraped from the chapter page's .edn_article element. Each fragment is anchored on a numbered paragraph (e.g. '1.1.1'): preceding headings and lead paragraphs are joined forward onto it, while tables, lists, and indented paragraphs are appended backward onto the previous fragment. Footer and navigation content (contact lines, 'Tags:', chapter-navigation links, references) is filtered out. Chapter text is copyright the Singapore Academy of Law and the chapters' credited academic authors."
+sort = "fragment_order"
+
+[resource.about_singapore_law_fragments.columns]
+id = "'{chapter_id}_{section_num}' where chapter_id is about_singapore_law.id and section_num is the fragment's anchoring numbered paragraph, e.g. 'a1b2c3d4e5f6_1.1.1'. Fragments are only created at numbered paragraphs, so section_num is always present."
+item_id = "Reference to about_singapore_law.id (semantic FK; sqlite does not enforce it)."
+fragment_order = "0-based position of the fragment within its chapter. Sorting by fragment_order reconstitutes reading order."
+content_text = "Fragment text: collected headings/lead paragraphs, the anchoring numbered paragraph, and any tables ('cell | cell' rows), lists (lines prefixed '- ' for unordered lists or a bullet character for ordered and heuristically-detected lists), or indented follow-on paragraphs attached to it, joined with blank lines. Heuristic extraction — structure is reconstructed from page markup and may imperfectly reflect the source layout."
+char_count = "Character count of content_text after all grouping."
 
 [resource.commentaries]
-description = "Law firm commentaries on recent Singapore legislation, judgments, and legal developments."
+description = "Law firm commentaries on Singapore legal developments from the Singapore Law Watch Commentaries RSS feed. PDF links are converted to markdown via a self-hosted docling-serve instance; web links are extracted via Jina Reader. Append-only, keyed on the link URL. Copyright in each commentary belongs to its publishing law firm and authors — follow link for the original."
 sort_desc = "pub_date"
 label_column = "title"
 facets = ["author", "content_type"]
@@ -55,13 +66,23 @@ fragments_fts_fields = ["text"]
 size = 20
 
 [resource.commentaries.columns]
-id = "Unique hash identifier for the commentary"
-title = "Title of the commentary"
-author = "Publishing law firm or organisation"
-pub_date = "Publication date in ISO 8601 format"
-link = "URL to the original commentary (law firm website or PDF)"
-content_type = "Source format: 'pdf' or 'web'"
-description = "Brief excerpt from the RSS feed"
-full_text = "Full extracted text content (via docling for PDFs, Jina Reader for web pages)"
-imported_on = "Timestamp when the record was imported"
+id = "Opaque MD5 hash of the link URL (full 32 hex chars) — the dedup key. commentaries_fragments.commentary_id points here."
+title = "Commentary title from the RSS feed."
+author = "RSS author field (falling back to the category field when absent) — in practice the publishing law firm or organisation, e.g. a firm name."
+pub_date = "Publication date parsed from the RSS 'published' field into ISO 8601. Falls back to the ingest timestamp if unparseable."
+link = "URL of the original commentary — a law firm web page or a PDF."
+content_type = "Extraction route, derived from the URL: 'pdf' (ends in .pdf — converted via docling-serve) or 'web' (everything else — extracted via Jina Reader)."
+description = "Brief excerpt/summary carried in the RSS feed entry."
+full_text = "Full extracted text: markdown from docling-serve for PDFs (images replaced with placeholders), Jina Reader output for web pages. Empty string when extraction failed — the row is still stored, and the fragments table falls back to description."
+imported_on = "ISO 8601 timestamp when the row was ingested."
 
+[resource.commentaries_fragments]
+description = "Fixed-size searchable chunks of each commentary's full_text: 1,200-character windows with 150 characters of overlap between consecutive chunks. When a commentary's full_text is empty (extraction failed), its RSS description becomes the sole fragment. Copyright in the underlying text belongs to the publishing law firm and authors."
+sort = "fragment_index"
+
+[resource.commentaries_fragments.columns]
+id = "Opaque MD5 hash of '{commentary_id}|{fragment_index}' (full 32 hex chars)."
+commentary_id = "Reference to commentaries.id (semantic FK; sqlite does not enforce it)."
+fragment_index = "0-based chunk index within the commentary. Sorting by fragment_index reconstitutes reading order; remember consecutive chunks overlap by 150 characters."
+text = "The chunk text: a 1,200-character window of full_text (whitespace-trimmed), or the RSS description when full text could not be extracted. Chunk boundaries are character-based and may split words/sentences."
+char_count = "Character count of text after trimming."
