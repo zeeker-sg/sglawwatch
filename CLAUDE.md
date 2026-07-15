@@ -194,5 +194,40 @@ S3_BUCKET=your-bucket AWS_ACCESS_KEY_ID=your-key AWS_SECRET_ACCESS_KEY=your-secr
 
 ---
 
-This file is automatically created by Zeeker and can be customized for your project's needs.
-The main Zeeker development guide is in the repository root CLAUDE.md file.
+## Build Monitoring Guide (for AI agents)
+
+This section helps AI agents monitoring the build pipeline interpret log output correctly.
+
+### Resources and what "no data returned" means
+
+| Resource | Source | Proxy required? | Normal "no data" cause | Abnormal "no data" cause |
+|----------|--------|-----------------|----------------------|------------------------|
+| `headlines` | Singapore LawWatch RSS feed | No | All headlines already imported (slow news day) | RSS feed unreachable, Jina Reader 422 errors |
+| `commentaries` | Singapore LawWatch Commentaries RSS + PDF via Docling | Yes (for PDF extraction only) | All commentaries already imported. RSS works but PDF extraction may fail | Docling server down (port 5001), proxy timeout for PDF URLs |
+| `about_singapore_law` | Singapore LawWatch About section | Yes | All articles already scraped | Proxy down → `RetryError[ProxyError]` |
+
+### Normal yield expectations
+
+- **headlines:** 0–10 new per day (typical: 2–5 on weekdays, 0 on weekends/holidays). Skips 40+ ads and 60+ old headlines per run.
+- **commentaries:** 0–3 new per day. 120+ already-imported entries skipped. PDF extraction adds ~10–80s per new commentary.
+- **about_singapore_law:** 0 new most days — articles are rarely added. ~46 total articles, stable.
+
+### How to tell a healthy skip from a failure
+
+- **Healthy skip:** Duration 0.1–5s, log shows "Skipped N already-imported entries" or "Skipping (published before last_update)"
+- **Failed skip (proxy):** Duration 20–200s, log shows `RetryError[ProxyError]` or `Failed to fetch sitemap`. about_singapore_law commonly affected.
+- **Failed skip (docling):** Duration 60–300s, log shows `docling failed: RetryError[...ConnectError]`. Commentaries affected.
+- **Failed skip (Jina):** Duration 5–30s, log shows `422 Unprocessable Entity` from Jina Reader. Rare, falls back to plain text.
+
+### Current DB stats (as of Jul 2026)
+
+- headlines: ~833 rows
+- commentaries: ~201 rows
+- about_singapore_law: ~46 rows
+
+### Build duration expectations
+
+- Fast run (all up to date): 5–10s total
+- Run with new headlines: 20–30s
+- Run with new commentaries (PDF extraction): 80–180s
+- Run with about_singapore_law: 5–10s (or 200s+ if proxy is timing out)

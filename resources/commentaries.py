@@ -74,7 +74,7 @@ def is_pdf(url: str) -> bool:
 @retry(stop=stop_after_attempt(3), wait=wait_exponential(multiplier=2, min=1, max=15))
 async def extract_via_docling(url: str) -> str:
     """Download a PDF and convert to markdown via docling-serve."""
-    async with httpx.AsyncClient(timeout=90) as client:
+    async with httpx.AsyncClient(timeout=120) as client:
         pdf_resp = await client.get(url, follow_redirects=True)
         pdf_resp.raise_for_status()
         pdf_bytes = pdf_resp.content
@@ -89,7 +89,7 @@ async def extract_via_docling(url: str) -> str:
     # keeps the markdown free of base64-embedded image data (otherwise typical
     # commentary PDFs balloon to 600KB+ of mostly image dumps).
     async with _get_docling_semaphore():
-        async with httpx.AsyncClient(timeout=180) as client:
+        async with httpx.AsyncClient(timeout=300) as client:
             r = await client.post(
                 f"{DOCLING_URL}/v1/convert/file",
                 files=[("files", ("document.pdf", pdf_bytes, "application/pdf"))],

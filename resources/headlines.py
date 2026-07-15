@@ -8,7 +8,9 @@ import os
 from datetime import datetime, timezone
 from typing import Dict, Optional
 
-TOKEN_LOG_PATH = os.path.expanduser("~/.config/zeeker/token_usage.jsonl")
+TOKEN_LOG_PATH = os.environ.get(
+    "ZEEKER_TOKEN_LOG", "/workspace/agent/token_usage.jsonl"
+)
 
 import click
 import feedparser
@@ -23,14 +25,18 @@ HEADLINES_URL = "https://www.singaporelawwatch.sg/Portals/0/RSS/Headlines.xml"
 # most time-out waiting in the queue.
 # Lazy-init so the semaphore binds to whichever event loop runs first,
 # not the import-time loop (which may differ from the asyncio.run() loop).
-_LLM_SEMAPHORE: Optional[asyncio.Semaphore] = None
+_LLM_SEMAPHORES: Dict[int, asyncio.Semaphore] = {}
 
 
 def _get_llm_semaphore() -> asyncio.Semaphore:
-    global _LLM_SEMAPHORE
-    if _LLM_SEMAPHORE is None:
-        _LLM_SEMAPHORE = asyncio.Semaphore(3)
-    return _LLM_SEMAPHORE
+    try:
+        loop = asyncio.get_running_loop()
+        loop_id = id(loop)
+    except RuntimeError:
+        loop_id = 0
+    if loop_id not in _LLM_SEMAPHORES:
+        _LLM_SEMAPHORES[loop_id] = asyncio.Semaphore(3)
+    return _LLM_SEMAPHORES[loop_id]
 
 
 def _log_token_usage(*, endpoint: str, model: str, prompt_tokens: int | None, completion_tokens: int | None, call_type: str = "summary") -> None:
@@ -99,7 +105,9 @@ async def get_summary(text: str) -> str:
     # Route through Tailscale SOCKS5 proxy if set — needed to reach local Ollama
     # instances on the Tailscale network (e.g. houfus-macbook-pro:11434)
     http_client = None
-    if tailscale_proxy:
+    # Only route through Tailscale proxy for non-localhost targets (e.g. Mac Ollama on
+    # 100.x tailnet).  localhost / 127.0.0.1 cannot traverse a SOCKS5 proxy.
+    if tailscale_proxy and not any(h in base_url for h in ("127.0.0.1", "localhost")):
         try:
             proxy = httpx.Proxy(tailscale_proxy)
             http_client = httpx.AsyncClient(proxy=proxy, timeout=120)
