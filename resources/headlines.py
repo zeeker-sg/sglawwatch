@@ -8,15 +8,13 @@ import os
 from datetime import datetime, timezone
 from typing import Dict, Optional
 
-TOKEN_LOG_PATH = os.environ.get(
-    "ZEEKER_TOKEN_LOG", "/workspace/agent/token_usage.jsonl"
-)
-
 import click
 import feedparser
 import httpx
 from sqlite_utils.db import Table
 from tenacity import retry, stop_after_attempt, wait_exponential
+
+TOKEN_LOG_PATH = os.environ.get("ZEEKER_TOKEN_LOG", "/workspace/agent/token_usage.jsonl")
 
 HEADLINES_URL = "https://www.singaporelawwatch.sg/Portals/0/RSS/Headlines.xml"
 
@@ -39,7 +37,14 @@ def _get_llm_semaphore() -> asyncio.Semaphore:
     return _LLM_SEMAPHORES[loop_id]
 
 
-def _log_token_usage(*, endpoint: str, model: str, prompt_tokens: int | None, completion_tokens: int | None, call_type: str = "summary") -> None:
+def _log_token_usage(
+    *,
+    endpoint: str,
+    model: str,
+    prompt_tokens: int | None,
+    completion_tokens: int | None,
+    call_type: str = "summary",
+) -> None:
     """Write token usage to shared JSONL log."""
     record = {
         "ts": datetime.now(timezone.utc).isoformat(),
@@ -68,7 +73,7 @@ async def get_jina_reader_content(link: str) -> str:
     """Fetch content from the Jina reader link."""
     jina_token = os.environ.get("JINA_API_TOKEN")
     if not jina_token:
-        click.echo("JINA_API_TOKEN environment variable not set", err=True)
+        click.echo("headlines: JINA_API_TOKEN environment variable not set", err=True)
         return ""
     jina_link = f"https://r.jina.ai/{link}"
     headers = {
@@ -82,7 +87,7 @@ async def get_jina_reader_content(link: str) -> str:
             r.raise_for_status()  # Raises httpx.HTTPStatusError for 4xx/5xx responses
         return r.text
     except (httpx.RequestError, httpx.HTTPStatusError) as e:
-        click.echo(f"Error fetching content from Jina reader: {e}", err=True)
+        click.echo(f"headlines: error fetching content from Jina reader: {e}", err=True)
         raise
 
 
@@ -97,7 +102,7 @@ async def get_summary(text: str) -> str:
     tailscale_proxy = os.environ.get("TAILSCALE_PROXY", "")
 
     if not base_url:
-        click.echo("LLM_BASE_URL not set — skipping summary", err=True)
+        click.echo("headlines: LLM_BASE_URL not set — skipping summary", err=True)
         return ""
 
     from openai import AsyncOpenAI
@@ -111,9 +116,12 @@ async def get_summary(text: str) -> str:
         try:
             proxy = httpx.Proxy(tailscale_proxy)
             http_client = httpx.AsyncClient(proxy=proxy, timeout=120)
-            click.echo(f"  → Using Tailscale proxy for LLM: {tailscale_proxy}", err=True)
+            click.echo(f"headlines:   → using Tailscale proxy for LLM: {tailscale_proxy}", err=True)
         except Exception as e:
-            click.echo(f"  → Tailscale proxy setup failed: {e} — falling back to direct", err=True)
+            click.echo(
+                f"headlines:   → Tailscale proxy setup failed: {e} — falling back to direct",
+                err=True,
+            )
 
     client = AsyncOpenAI(
         base_url=base_url,
@@ -128,7 +136,10 @@ async def get_summary(text: str) -> str:
                 model=model,
                 messages=[
                     {"role": "system", "content": SYSTEM_PROMPT_TEXT},
-                    {"role": "user", "content": f"Here is an article to summarise:\n {text[:4000]}"},
+                    {
+                        "role": "user",
+                        "content": f"Here is an article to summarise:\n {text[:4000]}",
+                    },
                 ],
             )
         try:
@@ -147,7 +158,7 @@ async def get_summary(text: str) -> str:
             raise ValueError(f"LLM returned empty content (finish_reason={finish_reason})")
         return content
     except Exception as e:
-        click.echo(f"Error generating summary from LLM: {e}", err=True)
+        click.echo(f"headlines: error generating summary from LLM: {e}", err=True)
         raise
     finally:
         if http_client:
@@ -200,7 +211,9 @@ async def process_entry(entry: Dict) -> Optional[Dict]:
     """Process an entry from the RSS feed to extract necessary data.
 
     Returns a dict with entry data. Internal flags ``_jina_failed`` and
-    ``_openai_failed`` track failures so the caller can abort on high error rates.
+    ``_llm_failed`` mark entries that must be dropped from the returned batch
+    (their IDs are never stored, so they are retried on the next build).
+    ``_failure_reason`` carries the exception class + message for reporting.
     """
     try:
         # Convert ISO date string to datetime object
@@ -219,46 +232,59 @@ async def process_entry(entry: Dict) -> Optional[Dict]:
             "imported_on": datetime.now().isoformat(),
         }
 
-        # Fetch content from Jina reader with graceful fallback
-        click.echo(f"Processing: {entry_data['title']} from {entry_data['date']}")
+        click.echo(f"headlines: processing: {entry_data['title']} from {entry_data['date']}")
 
         # Check if URL is problematic (some URLs cause 422 errors with Jina Reader)
         source_url = entry_data["source_link"]
-        skip_jina = any(pattern in source_url for pattern in [
-            'store.lawnet.com',  # Known to cause 422 errors
-            'utm_source=',       # URLs with tracking parameters sometimes fail
-        ])
+        skip_jina = any(
+            pattern in source_url
+            for pattern in [
+                "store.lawnet.com",  # Known to cause 422 errors
+                "utm_source=",  # URLs with tracking parameters sometimes fail
+            ]
+        )
 
         jina_failed = False
+        llm_failed = False
+        failure_reason = ""
         try:
             if skip_jina:
-                click.echo(f"  → Skipping Jina Reader for problematic URL pattern")
-                raise Exception("URL pattern known to cause issues")
+                raise ValueError("URL pattern known to cause Jina Reader errors")
             entry_data["text"] = await get_jina_reader_content(source_url)
         except Exception as jina_error:
             jina_failed = True
-            click.echo(f"  → Jina Reader failed: {jina_error}", err=True)
-            # Use fallback: title as content for summary generation
-            entry_data["text"] = f"Article: {entry_data['title']}\nSource: {source_url}\n\nContent could not be retrieved from source."
-            click.echo(f"  → Using fallback content for summary generation")
+            failure_reason = f"{type(jina_error).__name__}: {jina_error}"
+            click.echo(
+                "headlines: Jina Reader failed (entry dropped, will retry next build): "
+                f"{source_url}: {failure_reason}",
+                err=True,
+            )
 
-        # Generate summary using LLM
-        click.echo(f"  → Generating summary for: {entry_data['title']}")
-        llm_failed = False
-        try:
-            entry_data["summary"] = await get_summary(entry_data["text"])
-        except Exception as summary_error:
-            llm_failed = True
-            click.echo(f"  → Summary generation failed: {summary_error}", err=True)
-            # Fallback: use truncated title as summary
-            entry_data["summary"] = f"Legal news article: {entry_data['title'][:100]}{'...' if len(entry_data['title']) > 100 else ''}"
-            click.echo(f"  → Using fallback summary")
+        # Generate summary using LLM (only if content retrieval succeeded —
+        # a dropped entry is retried in full on the next build anyway)
+        if not jina_failed:
+            click.echo(f"headlines:   → generating summary for: {entry_data['title']}")
+            try:
+                entry_data["summary"] = await get_summary(entry_data["text"])
+            except Exception as summary_error:
+                llm_failed = True
+                failure_reason = f"{type(summary_error).__name__}: {summary_error}"
+                click.echo(
+                    "headlines: LLM summary failed (entry dropped, will retry next build): "
+                    f"{source_url}: {failure_reason}",
+                    err=True,
+                )
 
         entry_data["_jina_failed"] = jina_failed
         entry_data["_llm_failed"] = llm_failed
+        entry_data["_failure_reason"] = failure_reason
         return entry_data
     except Exception as e:
-        click.echo(f"Error processing entry '{entry.get('title', 'Unknown')}': {e}", err=True)
+        click.echo(
+            f"headlines: error processing entry '{entry.get('title', 'Unknown')}': "
+            f"{type(e).__name__}: {e}",
+            err=True,
+        )
         return None
 
 
@@ -280,14 +306,14 @@ def _get_existing_data(existing_table: Optional[Table]) -> tuple[set, Optional[d
 
     # Use the most recent article date from actual data, not the build timestamp
     try:
-        row = next(existing_table.db.execute(
-            f"SELECT MAX(date) as max_date FROM [{existing_table.name}]"
-        ))
+        row = next(
+            existing_table.db.execute(f"SELECT MAX(date) as max_date FROM [{existing_table.name}]")
+        )
         if row and row[0]:
             last_article_date = datetime.fromisoformat(row[0])
-            click.echo(f"  → Last article date in DB: {last_article_date.isoformat()}")
+            click.echo(f"headlines:   → last article date in DB: {last_article_date.isoformat()}")
     except Exception as e:
-        click.echo(f"Could not get max article date from table: {e}", err=True)
+        click.echo(f"headlines: could not get max article date from table: {e}", err=True)
 
     return existing_ids, last_article_date
 
@@ -309,7 +335,7 @@ def _should_skip_entry(
     try:
         entry_date = datetime.fromisoformat(convert_date_to_iso(entry.get("published", "")))
     except ValueError:
-        click.echo(f"Error parsing date for entry: {title}", err=True)
+        click.echo(f"headlines: error parsing date for entry: {title}", err=True)
         return True, "date_error"
 
     days_old = (current_date - entry_date).days
@@ -335,26 +361,32 @@ def _log_skip_counts(
 ):
     """Log summary of skipped entries."""
     if skipped_adv_count > 0:
-        click.echo(f"Skipped {skipped_adv_count} advertisements")
+        click.echo(f"headlines: skipped {skipped_adv_count} advertisements")
     if skipped_old_count > 0:
-        click.echo(f"Skipped {skipped_old_count} headlines older than {max_day_limit} days")
+        click.echo(
+            f"headlines: skipped {skipped_old_count} headlines older than {max_day_limit} days"
+        )
     if skipped_processed_time_count > 0:
         click.echo(
-            f"Skipped {skipped_processed_time_count} headlines older than last update timestamp"
+            f"headlines: skipped {skipped_processed_time_count} headlines older than last update timestamp"
         )
     if skipped_processed_id_count > 0:
-        click.echo(f"Skipped {skipped_processed_id_count} headlines with duplicate IDs in database")
+        click.echo(
+            f"headlines: skipped {skipped_processed_id_count} headlines with duplicate IDs in database"
+        )
 
 
 async def _fetch_article_text(url: str) -> str:
     """Fetch plain text from an article URL (HTTP fallback, no Jina required)."""
     try:
         async with httpx.AsyncClient(timeout=30, follow_redirects=True) as client:
-            r = await client.get(url, headers={"User-Agent": "ZeekerBot/1.0 (+https://data.zeeker.sg)"})
+            r = await client.get(
+                url, headers={"User-Agent": "ZeekerBot/1.0 (+https://data.zeeker.sg)"}
+            )
             r.raise_for_status()
             return r.text[:8000]
     except Exception as e:
-        click.echo(f"  → HTTP fetch failed for {url}: {e}", err=True)
+        click.echo(f"headlines:   → HTTP fetch failed for {url}: {e}", err=True)
         return ""
 
 
@@ -364,19 +396,23 @@ async def _backfill_empty_summaries(existing_table: Optional[Table]) -> None:
         return
 
     try:
-        rows = list(existing_table.db.execute(
-            f"SELECT id, title, source_link FROM [{existing_table.name}] "
-            "WHERE summary IS NULL OR summary = '' OR summary = 'None'"
-        ))
+        rows = list(
+            existing_table.db.execute(
+                f"SELECT id, title, source_link FROM [{existing_table.name}] "
+                "WHERE summary IS NULL OR summary = '' OR summary = 'None'"
+            )
+        )
     except Exception as e:
-        click.echo(f"Backfill: could not query empty summaries: {e}", err=True)
+        click.echo(f"headlines: backfill: could not query empty summaries: {e}", err=True)
         return
 
     if not rows:
-        click.echo("Backfill: no empty summaries found")
+        click.echo("headlines: backfill: no empty summaries found")
         return
 
-    click.echo(f"Backfill: found {len(rows)} articles with empty summaries — regenerating")
+    click.echo(
+        f"headlines: backfill: found {len(rows)} articles with empty summaries — regenerating"
+    )
 
     async def _fix_one(row_id: str, title: str, source_link: str) -> None:
         text = await _fetch_article_text(source_link)
@@ -386,16 +422,15 @@ async def _backfill_empty_summaries(existing_table: Optional[Table]) -> None:
             async with _get_llm_semaphore():
                 summary = await get_summary(text)
             existing_table.db.execute(
-                f"UPDATE [{existing_table.name}] SET summary = ? WHERE id = ?",
-                [summary, row_id]
+                f"UPDATE [{existing_table.name}] SET summary = ? WHERE id = ?", [summary, row_id]
             )
-            click.echo(f"  → Backfilled summary for: {title[:60]}")
+            click.echo(f"headlines:   → backfilled summary for: {title[:60]}")
         except Exception as e:
-            click.echo(f"  → Backfill failed for {title[:60]}: {e}", err=True)
+            click.echo(f"headlines:   → backfill failed for {title[:60]}: {e}", err=True)
 
     tasks = [asyncio.create_task(_fix_one(r[0], r[1], r[2])) for r in rows]
     await asyncio.gather(*tasks)
-    click.echo(f"Backfill: done ({len(rows)} articles processed)")
+    click.echo(f"headlines: backfill: done ({len(rows)} articles processed)")
 
 
 async def fetch_data(existing_table: Optional[Table]):
@@ -411,7 +446,7 @@ async def fetch_data(existing_table: Optional[Table]):
 
     """
     await _backfill_empty_summaries(existing_table)
-    click.echo(f"Fetching headlines from {HEADLINES_URL}")
+    click.echo(f"headlines: fetching headlines from {HEADLINES_URL}")
     feed = feedparser.parse(HEADLINES_URL)
     max_day_limit = 60
     current_date = datetime.now()
@@ -434,23 +469,23 @@ async def fetch_data(existing_table: Optional[Table]):
             title = entry.get("title", "")
             if skip_reason == "advertisement":
                 skipped_adv_count += 1
-                click.echo(f"Skipping advertisement: {title}")
+                click.echo(f"headlines: skipping advertisement: {title}")
             elif skip_reason == "too_old":
                 skipped_old_count += 1
                 days_old = (
                     current_date
                     - datetime.fromisoformat(convert_date_to_iso(entry.get("published", "")))
                 ).days
-                click.echo(f"Skipping old headline ({days_old} days): {title}")
+                click.echo(f"headlines: skipping old headline ({days_old} days): {title}")
             elif skip_reason == "already_processed_by_time":
                 skipped_processed_time_count += 1
                 entry_date_str = entry.get("published", "")
                 click.echo(
-                    f"  → Skipping (published {entry_date_str}, before last_updated {last_updated.strftime('%Y-%m-%d %H:%M:%S') if last_updated else 'None'}): {title}"
+                    f"headlines:   → skipping (published {entry_date_str}, before last_updated {last_updated.strftime('%Y-%m-%d %H:%M:%S') if last_updated else 'None'}): {title}"
                 )
             elif skip_reason == "already_processed_by_id":
                 skipped_processed_id_count += 1
-                click.echo(f"  → Skipping (duplicate ID in database): {title}")
+                click.echo(f"headlines:   → skipping (duplicate ID in database): {title}")
             continue
 
         new_entries_count += 1
@@ -459,41 +494,43 @@ async def fetch_data(existing_table: Optional[Table]):
 
     results = await asyncio.gather(*tasks)
 
-    # Check failure rates — if most entries failed, something is wrong
-    # (e.g. expired API token, service outage)
+    # Degrade instead of abort: entries whose content fetch or summary failed
+    # are EXCLUDED from the returned batch. Their IDs are never stored, so
+    # they are automatically retried on the next build (self-healing) —
+    # nothing is ever stored with placeholder text or placeholder summaries.
     valid_results = [r for r in results if r is not None]
     jina_failures = [r for r in valid_results if r.get("_jina_failed")]
     llm_failures = [r for r in valid_results if r.get("_llm_failed")]
+    dropped = jina_failures + llm_failures
+    kept = [r for r in valid_results if not (r.get("_jina_failed") or r.get("_llm_failed"))]
 
-    if valid_results and len(jina_failures) > len(valid_results) * 0.5:
-        raise RuntimeError(
-            f"Jina Reader failed for {len(jina_failures)}/{len(valid_results)} entries. "
-            f"Check JINA_API_TOKEN or Jina service status. "
-            f"Aborting to avoid storing garbage data."
+    if dropped:
+        reasons = []
+        if jina_failures:
+            reasons.append("Jina Reader failures; check JINA_API_TOKEN or Jina status")
+        if llm_failures:
+            reasons.append(
+                "LLM summary failures; check LLM_BASE_URL, LLM_API_KEY, LLM_MODEL or service status"
+            )
+        click.echo(
+            f"headlines: DEGRADED — dropped {len(dropped)}/{len(valid_results)} entries "
+            f"for retry next build ({'; '.join(reasons)})",
+            err=True,
         )
-    if valid_results and len(llm_failures) > len(valid_results) * 0.5:
-        raise RuntimeError(
-            f"LLM failed for {len(llm_failures)}/{len(valid_results)} entries. "
-            f"Check LLM_BASE_URL, LLM_API_KEY, and LLM_MODEL or service status. "
-            f"Aborting to avoid storing garbage data."
-        )
+        for r in dropped:
+            click.echo(
+                f"headlines:   dropped: {r.get('source_link', '')}: "
+                f"{r.get('_failure_reason') or 'unknown error'}",
+                err=True,
+            )
 
     # Strip internal flags before returning
-    for r in valid_results:
+    for r in kept:
         r.pop("_jina_failed", None)
         r.pop("_llm_failed", None)
+        r.pop("_failure_reason", None)
 
-    click.echo(f"Added {new_entries_count} new headlines")
-    if jina_failures:
-        click.echo(
-            f"⚠️  Jina Reader failed for {len(jina_failures)}/{len(valid_results)} entries",
-            err=True,
-        )
-    if llm_failures:
-        click.echo(
-            f"⚠️  LLM failed for {len(llm_failures)}/{len(valid_results)} entries",
-            err=True,
-        )
+    click.echo(f"headlines: added {len(kept)} new headlines ({new_entries_count} candidates)")
     _log_skip_counts(
         skipped_adv_count,
         skipped_old_count,
@@ -501,6 +538,4 @@ async def fetch_data(existing_table: Optional[Table]):
         skipped_processed_id_count,
         max_day_limit,
     )
-    return results
-
-
+    return kept

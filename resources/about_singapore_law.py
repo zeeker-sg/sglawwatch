@@ -13,6 +13,7 @@ import os
 import time
 from typing import Any, Dict, List, Optional
 
+import click
 import httpx
 from bs4 import BeautifulSoup
 from sqlite_utils.db import Table
@@ -53,7 +54,12 @@ def fetch_data(existing_table: Optional[Table]) -> List[Dict[str, Any]]:
 
             time.sleep(1)  # Be respectful
 
-        except Exception:
+        except Exception as e:
+            click.echo(
+                f"about_singapore_law: failed to process section {home_url}: "
+                f"{type(e).__name__}: {e}",
+                err=True,
+            )
             continue
 
     return all_items
@@ -73,27 +79,53 @@ def fetch_fragments_data(
         existing_fragment_ids = {row["id"] for row in existing_fragments_table.rows}
 
     all_fragments = []
+    scraped_count = 0
+    failed_count = 0
+    skipped_count = 0
 
     for chapter in main_data_context:
+        chapter_url = chapter.get("item_url", "")
         try:
-            # Scrape chapter content
-            paragraphs = scrape_chapter_content(chapter["item_url"])
-
-            if paragraphs:
-                # Create fragments
-                fragments = create_content_fragments(paragraphs, chapter["id"])
-
-                # Filter existing fragments
-                new_fragments = [f for f in fragments if f["id"] not in existing_fragment_ids]
-
-                all_fragments.extend(new_fragments)
-                print(f"Created {len(new_fragments)} fragments")
-
-            time.sleep(1)  # Be respectful
-
+            # Scrape chapter content — raises on fetch/parse failure
+            paragraphs = scrape_chapter_content(chapter_url)
         except Exception as e:
-            print(f"Error processing {chapter['title']}: {e}")
+            failed_count += 1
+            click.echo(
+                f"about_singapore_law: failed to scrape chapter {chapter_url}: "
+                f"{type(e).__name__}: {e}",
+                err=True,
+            )
+            time.sleep(1)  # Be respectful
             continue
+
+        if not paragraphs:
+            # No usable content — skip the chapter (do NOT emit an empty record)
+            skipped_count += 1
+            click.echo(
+                f"about_singapore_law: no content extracted from {chapter_url} — skipping chapter",
+                err=True,
+            )
+            time.sleep(1)  # Be respectful
+            continue
+
+        # Create fragments
+        fragments = create_content_fragments(paragraphs, chapter["id"])
+
+        # Filter existing fragments
+        new_fragments = [f for f in fragments if f["id"] not in existing_fragment_ids]
+
+        all_fragments.extend(new_fragments)
+        scraped_count += 1
+        click.echo(
+            f"about_singapore_law: created {len(new_fragments)} fragments from {chapter_url}"
+        )
+
+        time.sleep(1)  # Be respectful
+
+    click.echo(
+        f"about_singapore_law: done — {scraped_count} chapters scraped, "
+        f"{failed_count} failed, {skipped_count} skipped"
+    )
 
     return all_fragments
 
@@ -165,94 +197,93 @@ def discover_chapter_links(section_url: str, section_name: str) -> List[Dict[str
 
         return chapter_links
 
-    except Exception:
+    except Exception as e:
+        click.echo(
+            f"about_singapore_law: failed to discover chapters from {section_url}: "
+            f"{type(e).__name__}: {e}",
+            err=True,
+        )
         return []
 
 
 def scrape_chapter_content(chapter_url: str) -> list[dict]:
-    """Extract main content from a chapter page, processing all content tags in order."""
+    """Extract main content from a chapter page, processing all content tags in order.
 
-    try:
-        response = httpx.get(chapter_url, timeout=30.0)
-        response.raise_for_status()
-        soup = BeautifulSoup(response.content, "html.parser")
+    Raises on fetch/parse failure — callers decide how to report and skip.
+    Returns an empty list when the page yields no usable content.
+    """
 
-        article = soup.select(".edn_article")[0]
+    response = httpx.get(chapter_url, timeout=30.0)
+    response.raise_for_status()
+    soup = BeautifulSoup(response.content, "html.parser")
 
-        # Get all content elements in order (paragraphs, tables, lists, etc.)
-        content_elements = article.find_all(
-            ["p", "table", "ul", "ol", "div", "h1", "h2", "h3", "h4", "h5", "h6"]
-        )
+    article = soup.select(".edn_article")[0]
 
-        # Remove elements that are nested inside tables or lists to avoid duplicates
-        filtered_elements = []
-        for element in content_elements:
-            # Skip if this element is inside a table (we already capture table content)
-            if element.find_parent("table"):
-                continue
-            # Skip if this element is inside a ul/ol list (we already capture list content)
-            if element.find_parent(["ul", "ol"]):
-                continue
-            filtered_elements.append(element)
+    # Get all content elements in order (paragraphs, tables, lists, etc.)
+    content_elements = article.find_all(
+        ["p", "table", "ul", "ol", "div", "h1", "h2", "h3", "h4", "h5", "h6"]
+    )
 
-        content_elements = filtered_elements
+    # Remove elements that are nested inside tables or lists to avoid duplicates
+    filtered_elements = []
+    for element in content_elements:
+        # Skip if this element is inside a table (we already capture table content)
+        if element.find_parent("table"):
+            continue
+        # Skip if this element is inside a ul/ol list (we already capture list content)
+        if element.find_parent(["ul", "ol"]):
+            continue
+        filtered_elements.append(element)
 
-        content_parts = []
-        for element in content_elements:
-            if element.name == "table":
-                # Extract table content as structured text
-                table_text = extract_table_text(element)
-                if table_text.strip():
-                    content_parts.append(
-                        {
-                            "text": table_text,
-                            "type": "table",
-                            "original_text": element.get_text(strip=True),
-                        }
-                    )
-            elif element.name in ["ul", "ol"]:
-                # Extract list content
-                list_text = extract_list_text(element)
-                if list_text.strip():
-                    content_parts.append(
-                        {
-                            "text": list_text,
-                            "type": "list",
-                            "original_text": element.get_text(strip=True),
-                        }
-                    )
-            elif element.name in ["h1", "h2", "h3", "h4", "h5", "h6"]:
-                # Extract heading text
-                heading_text = element.get_text(strip=True)
-                if heading_text:
-                    content_parts.append(
-                        {"text": heading_text, "type": "heading", "original_text": heading_text}
-                    )
-            elif element.name in ["p", "div"]:
-                # Extract paragraph/div text - preserve original spacing for indentation check
-                original_text = str(element)
-                text = element.get_text(strip=True)
-                if text:
-                    content_parts.append(
-                        {"text": text, "type": "paragraph", "original_text": original_text}
-                    )
+    content_elements = filtered_elements
 
-        # Post-process to group consecutive indented paragraphs that should be list items
-        content_parts = group_pseudo_list_items(content_parts)
+    content_parts = []
+    for element in content_elements:
+        if element.name == "table":
+            # Extract table content as structured text
+            table_text = extract_table_text(element)
+            if table_text.strip():
+                content_parts.append(
+                    {
+                        "text": table_text,
+                        "type": "table",
+                        "original_text": element.get_text(strip=True),
+                    }
+                )
+        elif element.name in ["ul", "ol"]:
+            # Extract list content
+            list_text = extract_list_text(element)
+            if list_text.strip():
+                content_parts.append(
+                    {
+                        "text": list_text,
+                        "type": "list",
+                        "original_text": element.get_text(strip=True),
+                    }
+                )
+        elif element.name in ["h1", "h2", "h3", "h4", "h5", "h6"]:
+            # Extract heading text
+            heading_text = element.get_text(strip=True)
+            if heading_text:
+                content_parts.append(
+                    {"text": heading_text, "type": "heading", "original_text": heading_text}
+                )
+        elif element.name in ["p", "div"]:
+            # Extract paragraph/div text - preserve original spacing for indentation check
+            original_text = str(element)
+            text = element.get_text(strip=True)
+            if text:
+                content_parts.append(
+                    {"text": text, "type": "paragraph", "original_text": original_text}
+                )
 
-        # Filter out footer content - stop processing when we hit footer markers
-        content_parts = filter_footer_content(content_parts)
+    # Post-process to group consecutive indented paragraphs that should be list items
+    content_parts = group_pseudo_list_items(content_parts)
 
-        for content in content_parts:
-            print(
-                f"[{content['type']}] {content['text'][:100]}{'...' if len(content['text']) > 100 else ''}"
-            )
+    # Filter out footer content - stop processing when we hit footer markers
+    content_parts = filter_footer_content(content_parts)
 
-        return content_parts
-
-    except Exception as e:
-        print(f"Error scraping {chapter_url}: {e}")
-        return [{"text": "", "type": "paragraph", "original_text": ""}]
+    return content_parts
 
 
 def extract_table_text(table_element) -> str:
