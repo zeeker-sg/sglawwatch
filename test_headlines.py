@@ -457,8 +457,12 @@ class TestDegradedBatchHandling:
         assert result[0]["id"] == "good1"
 
     @pytest.mark.asyncio
-    async def test_total_failure_returns_empty_without_runtime_error(self):
-        """100% failure no longer raises RuntimeError — it returns an empty batch (skip)."""
+    async def test_total_failure_raises_blocked_skip(self):
+        """100% failure raises Skip(kind='blocked') — outage, not 'nothing new'."""
+        from zeeker import Skip
+
+        import resources.headlines as headlines_module
+
         mock_feed = self._make_feed(["Article A", "Article B", "Article C"])
 
         with patch("feedparser.parse", return_value=mock_feed):
@@ -469,10 +473,75 @@ class TestDegradedBatchHandling:
                     self._entry("c", llm_failed=True, reason="APIError: 500"),
                 ]
 
-                # Must NOT raise RuntimeError
-                result = await fetch_data(None)
+                with pytest.raises(Skip) as exc_info:
+                    await fetch_data(None)
+
+        assert exc_info.value.kind == "blocked"
+        assert "all 3 new entries failed (Jina/LLM)" in exc_info.value.reason
+        # The degradation counters are still surfaced via __zeeker_report__
+        # (zeeker consumes it on every exit path, including a raised Skip).
+        report = getattr(headlines_module, "__zeeker_report__", None)
+        assert report is not None
+        assert report["dropped_jina"] == 2
+        assert report["dropped_llm"] == 1
+        # Clean up the module-level report so other tests see fresh state
+        delattr(headlines_module, "__zeeker_report__")
+
+    @pytest.mark.asyncio
+    async def test_no_new_entries_returns_empty_not_skip(self):
+        """A feed with nothing new returns [] (up_to_date), never raises Skip."""
+        mock_feed = MagicMock()
+        mock_feed.entries = []
+
+        with patch("feedparser.parse", return_value=mock_feed):
+            result = await fetch_data(None)
 
         assert result == []
+
+    @pytest.mark.asyncio
+    async def test_partial_failure_sets_zeeker_report(self):
+        """Partial degradation returns kept rows AND sets __zeeker_report__ counters."""
+        import resources.headlines as headlines_module
+
+        mock_feed = self._make_feed(["Good Article", "Bad Article"])
+
+        with patch("feedparser.parse", return_value=mock_feed):
+            with patch("resources.headlines.process_entry", new_callable=AsyncMock) as mock_process:
+                mock_process.side_effect = [
+                    self._entry("good1"),
+                    self._entry("bad1", llm_failed=True, reason="TimeoutError: llm timed out"),
+                ]
+
+                result = await fetch_data(None)
+
+        assert len(result) == 1
+        assert result[0]["id"] == "good1"
+        report = getattr(headlines_module, "__zeeker_report__", None)
+        assert report is not None
+        assert report["dropped_jina"] == 0
+        assert report["dropped_llm"] == 1
+        assert "notes" in report
+        delattr(headlines_module, "__zeeker_report__")
+
+    @pytest.mark.asyncio
+    async def test_full_success_leaves_no_zeeker_report(self):
+        """No drops → __zeeker_report__ is not set (no noise on the status line)."""
+        import resources.headlines as headlines_module
+
+        # Ensure no stale report from a previous test
+        if hasattr(headlines_module, "__zeeker_report__"):
+            delattr(headlines_module, "__zeeker_report__")
+
+        mock_feed = self._make_feed(["Good Article"])
+
+        with patch("feedparser.parse", return_value=mock_feed):
+            with patch("resources.headlines.process_entry", new_callable=AsyncMock) as mock_process:
+                mock_process.return_value = self._entry("good1")
+
+                result = await fetch_data(None)
+
+        assert len(result) == 1
+        assert not hasattr(headlines_module, "__zeeker_report__")
 
     @pytest.mark.asyncio
     async def test_internal_flags_stripped_from_stored_rows(self):

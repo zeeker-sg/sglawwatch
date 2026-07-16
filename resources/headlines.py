@@ -13,6 +13,7 @@ import feedparser
 import httpx
 from sqlite_utils.db import Table
 from tenacity import retry, stop_after_attempt, wait_exponential
+from zeeker import Skip
 
 TOKEN_LOG_PATH = os.environ.get("ZEEKER_TOKEN_LOG", "/workspace/agent/token_usage.jsonl")
 
@@ -522,6 +523,29 @@ async def fetch_data(existing_table: Optional[Table]):
                 f"headlines:   dropped: {r.get('source_link', '')}: "
                 f"{r.get('_failure_reason') or 'unknown error'}",
                 err=True,
+            )
+
+        # Surface the degradation counters on the build status line and in
+        # --json (zeeker >= 0.9.0 consumes __zeeker_report__ on every exit
+        # path, including the Skip raised below).
+        global __zeeker_report__
+        __zeeker_report__ = {
+            "dropped_jina": len(jina_failures),
+            "dropped_llm": len(llm_failures),
+            "notes": (
+                f"dropped {len(dropped)}/{len(valid_results)} new entries for retry "
+                f"next build ({'; '.join(reasons)})"
+            ),
+        }
+
+        # Fully degraded: new entries were discovered but every one of them
+        # failed (Jina fetch or LLM summary). Raise a blocked Skip so the
+        # build status distinguishes this outage from a genuine "nothing new"
+        # day — and so the _zeeker_updates freshness marker does NOT advance.
+        if not kept:
+            raise Skip(
+                f"all {len(dropped)} new entries failed (Jina/LLM); retrying next build",
+                kind="blocked",
             )
 
     # Strip internal flags before returning
