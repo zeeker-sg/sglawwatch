@@ -68,40 +68,43 @@ class TestUtilityFunctions:
 
     def test_should_skip_advertisements(self):
         """Test that advertisements are properly filtered out."""
-        from resources.headlines import _should_skip_entry
         from datetime import datetime
 
+        from resources.headlines import _should_skip_entry
+
         current_date = datetime.now()
-        
+
         # Test ADV: format
         adv_entry_1 = {
             "title": "ADV: Some advertisement content",
-            "published": "04 Sep 2025 00:01:00"
+            "published": "04 Sep 2025 00:01:00",
         }
-        
+
         # Test ADV JLP: format (space after ADV)
         adv_entry_2 = {
             "title": "ADV JLP: Starting an Action (Disputes)",
-            "published": "04 Sep 2025 00:01:00"
+            "published": "04 Sep 2025 00:01:00",
         }
-        
+
         # Test normal article (should not be skipped for advertisement)
         normal_entry = {
             "title": "Singapore, India to launch roadmap on cooperation",
-            "published": "04 Sep 2025 00:01:00"
+            "published": "04 Sep 2025 00:01:00",
         }
-        
+
         # Test advertisement filtering
         should_skip_1, reason_1 = _should_skip_entry(adv_entry_1, current_date, None, set())
         assert should_skip_1 is True
         assert reason_1 == "advertisement"
-        
+
         should_skip_2, reason_2 = _should_skip_entry(adv_entry_2, current_date, None, set())
         assert should_skip_2 is True
         assert reason_2 == "advertisement"
-        
+
         # Normal entry should not be skipped for advertisement
-        should_skip_normal, reason_normal = _should_skip_entry(normal_entry, current_date, None, set())
+        should_skip_normal, reason_normal = _should_skip_entry(
+            normal_entry, current_date, None, set()
+        )
         # It might be skipped for other reasons, but not for advertisement
         if should_skip_normal:
             assert reason_normal != "advertisement"
@@ -133,9 +136,9 @@ class TestAsyncFunctions:
                 assert result == "Article content here"
 
     @pytest.mark.asyncio
-    async def test_get_summary_missing_api_key(self):
-        """Test summary generation with missing OpenAI API key."""
-        with patch.dict("os.environ", {}, clear=True):
+    async def test_get_summary_missing_base_url(self):
+        """Test summary generation skips when LLM_BASE_URL is explicitly empty."""
+        with patch.dict("os.environ", {"LLM_BASE_URL": ""}, clear=True):
             result = await get_summary("Some article text")
             assert result == ""
 
@@ -143,12 +146,17 @@ class TestAsyncFunctions:
     async def test_get_summary_success(self):
         """Test successful summary generation."""
         mock_response = MagicMock()
-        mock_response.output_text = "This is a summary"
+        mock_response.choices = [MagicMock()]
+        mock_response.choices[0].message.content = "This is a summary"
 
-        with patch.dict("os.environ", {"OPENAI_API_KEY": "test-key"}):
+        with patch.dict(
+            "os.environ",
+            {"LLM_BASE_URL": "http://localhost:11434/v1", "LLM_API_KEY": "test-key"},
+            clear=True,
+        ):
             with patch("openai.AsyncOpenAI") as mock_openai:
                 mock_client = MagicMock()
-                mock_client.responses.create = AsyncMock(return_value=mock_response)
+                mock_client.chat.completions.create = AsyncMock(return_value=mock_response)
                 mock_openai.return_value = mock_client
 
                 result = await get_summary("Article text to summarize")
@@ -190,7 +198,15 @@ class TestAsyncFunctions:
         """Test entry processing with exception."""
         entry = {"published": "invalid date", "title": "Test Article"}
 
-        result = await process_entry(entry)
+        with patch(
+            "resources.headlines.get_jina_reader_content", new_callable=AsyncMock
+        ) as mock_jina:
+            with patch("resources.headlines.get_summary", new_callable=AsyncMock) as mock_summary:
+                mock_jina.return_value = "Article content"
+                mock_summary.return_value = "Article summary"
+
+                result = await process_entry(entry)
+
         # The function handles invalid dates gracefully and returns data with fallback values
         assert result is not None
         assert result["title"] == "Test Article"
@@ -239,15 +255,16 @@ class TestAsyncFunctions:
         """Test fetch_data with existing table and metadata."""
         mock_table = MagicMock()
         mock_table.name = "headlines"
+        mock_table.rows = []
 
         mock_db = MagicMock()
         mock_db.table_names.return_value = ["_zeeker_updates", "headlines"]
         mock_table.db = mock_db
 
         two_days_ago = (datetime.now() - timedelta(days=2)).isoformat()
-        mock_updates_table = MagicMock()
-        mock_updates_table.get.return_value = {"last_updated": two_days_ago}
-        mock_db.__getitem__.return_value = mock_updates_table
+        # _get_existing_data reads MAX(date) from the table; _backfill_empty_summaries
+        # queries for empty summaries first — return no rows for that call.
+        mock_db.execute.side_effect = [iter([]), iter([(two_days_ago,)])]
 
         yesterday = (datetime.now() - timedelta(days=1)).strftime("%d %B %Y %H:%M:%S")
         three_days_ago = (datetime.now() - timedelta(days=3)).strftime("%d %B %Y %H:%M:%S")
@@ -277,8 +294,8 @@ class TestAsyncFunctions:
                 assert mock_process.call_count == 1
 
     @pytest.mark.asyncio
-    async def test_process_entry_problematic_url_handling(self):
-        """Test that problematic URLs are handled gracefully."""
+    async def test_process_entry_problematic_url_flagged_for_drop(self):
+        """Problematic URLs are flagged _jina_failed so the entry is dropped, not stored."""
         from resources.headlines import process_entry
 
         # Entry with a problematic URL (store.lawnet.com)
@@ -291,20 +308,185 @@ class TestAsyncFunctions:
             "published": "04 Sep 2025 00:01:00",
         }
 
-        with patch("resources.headlines.get_jina_reader_content") as mock_jina, patch(
-            "resources.headlines.get_summary"
-        ) as mock_summary:
-            # Mock OpenAI response
-            mock_summary.return_value = "Fallback summary for legal article"
-
+        with (
+            patch(
+                "resources.headlines.get_jina_reader_content", new_callable=AsyncMock
+            ) as mock_jina,
+            patch("resources.headlines.get_summary", new_callable=AsyncMock) as mock_summary,
+        ):
             result = await process_entry(test_entry)
 
             # Should not call Jina Reader for problematic URLs
             assert mock_jina.call_count == 0
-            
-            # Should still return a valid result with fallback content
-            assert result is not None
-            assert result["title"] == "Test LawNet Article"
-            assert "Content could not be retrieved" in result["text"]
-            assert result["summary"] == "Fallback summary for legal article"
+            # Should not attempt a summary for a dropped entry
+            assert mock_summary.call_count == 0
 
+            # Entry is flagged for exclusion — no placeholder content is produced
+            assert result is not None
+            assert result["_jina_failed"] is True
+            assert "text" not in result
+            assert "summary" not in result
+            assert "Content could not be retrieved" not in str(result)
+
+    @pytest.mark.asyncio
+    async def test_process_entry_jina_exception_flagged_for_drop(self):
+        """A Jina Reader exception flags the entry _jina_failed with the failure reason."""
+        entry = {
+            "published": "04 Sep 2025 00:01:00",
+            "title": "Jina Down Article",
+            "link": "https://example.com/article",
+        }
+
+        with (
+            patch(
+                "resources.headlines.get_jina_reader_content", new_callable=AsyncMock
+            ) as mock_jina,
+            patch("resources.headlines.get_summary", new_callable=AsyncMock) as mock_summary,
+        ):
+            mock_jina.side_effect = ConnectionError("boom")
+
+            result = await process_entry(entry)
+
+            assert result is not None
+            assert result["_jina_failed"] is True
+            assert result["_llm_failed"] is False
+            assert "ConnectionError" in result["_failure_reason"]
+            assert "boom" in result["_failure_reason"]
+            # No placeholder text/summary is generated for a dropped entry
+            assert "text" not in result
+            assert "summary" not in result
+            assert mock_summary.call_count == 0
+
+    @pytest.mark.asyncio
+    async def test_process_entry_llm_exception_flagged_for_drop(self):
+        """An LLM exception flags the entry _llm_failed with the failure reason."""
+        entry = {
+            "published": "04 Sep 2025 00:01:00",
+            "title": "LLM Down Article",
+            "link": "https://example.com/article",
+        }
+
+        with (
+            patch(
+                "resources.headlines.get_jina_reader_content", new_callable=AsyncMock
+            ) as mock_jina,
+            patch("resources.headlines.get_summary", new_callable=AsyncMock) as mock_summary,
+        ):
+            mock_jina.return_value = "Article content"
+            mock_summary.side_effect = TimeoutError("llm timed out")
+
+            result = await process_entry(entry)
+
+            assert result is not None
+            assert result["_jina_failed"] is False
+            assert result["_llm_failed"] is True
+            assert "TimeoutError" in result["_failure_reason"]
+            # No placeholder summary is stored
+            assert "summary" not in result
+
+
+class TestDegradedBatchHandling:
+    """Tests for the degrade-instead-of-abort behavior in fetch_data."""
+
+    @staticmethod
+    def _make_feed(titles):
+        yesterday = (datetime.now() - timedelta(days=1)).strftime("%d %B %Y %H:%M:%S")
+        mock_feed = MagicMock()
+        mock_feed.entries = [
+            {
+                "published": yesterday,
+                "title": title,
+                "link": f"https://example.com/{i}",
+                "author": "Author",
+                "category": "Legal News",
+            }
+            for i, title in enumerate(titles)
+        ]
+        return mock_feed
+
+    @staticmethod
+    def _entry(entry_id, *, jina_failed=False, llm_failed=False, reason=""):
+        data = {
+            "id": entry_id,
+            "title": f"Article {entry_id}",
+            "source_link": f"https://example.com/{entry_id}",
+            "_jina_failed": jina_failed,
+            "_llm_failed": llm_failed,
+            "_failure_reason": reason,
+        }
+        if not jina_failed:
+            data["text"] = "Content"
+        if not (jina_failed or llm_failed):
+            data["summary"] = "Summary"
+        return data
+
+    @pytest.mark.asyncio
+    async def test_jina_failed_entries_excluded_from_results(self):
+        """Entries flagged _jina_failed are excluded so they retry next build."""
+        mock_feed = self._make_feed(["Good Article", "Bad Article"])
+
+        with patch("feedparser.parse", return_value=mock_feed):
+            with patch("resources.headlines.process_entry", new_callable=AsyncMock) as mock_process:
+                mock_process.side_effect = [
+                    self._entry("good1"),
+                    self._entry(
+                        "bad1", jina_failed=True, reason="HTTPStatusError: 422 Unprocessable"
+                    ),
+                ]
+
+                result = await fetch_data(None)
+
+        assert len(result) == 1
+        assert result[0]["id"] == "good1"
+
+    @pytest.mark.asyncio
+    async def test_llm_failed_entries_excluded_from_results(self):
+        """Entries flagged _llm_failed are excluded so they retry next build."""
+        mock_feed = self._make_feed(["Good Article", "Bad Article"])
+
+        with patch("feedparser.parse", return_value=mock_feed):
+            with patch("resources.headlines.process_entry", new_callable=AsyncMock) as mock_process:
+                mock_process.side_effect = [
+                    self._entry("good1"),
+                    self._entry("bad1", llm_failed=True, reason="TimeoutError: llm timed out"),
+                ]
+
+                result = await fetch_data(None)
+
+        assert len(result) == 1
+        assert result[0]["id"] == "good1"
+
+    @pytest.mark.asyncio
+    async def test_total_failure_returns_empty_without_runtime_error(self):
+        """100% failure no longer raises RuntimeError — it returns an empty batch (skip)."""
+        mock_feed = self._make_feed(["Article A", "Article B", "Article C"])
+
+        with patch("feedparser.parse", return_value=mock_feed):
+            with patch("resources.headlines.process_entry", new_callable=AsyncMock) as mock_process:
+                mock_process.side_effect = [
+                    self._entry("a", jina_failed=True, reason="ConnectError: no route"),
+                    self._entry("b", jina_failed=True, reason="ConnectError: no route"),
+                    self._entry("c", llm_failed=True, reason="APIError: 500"),
+                ]
+
+                # Must NOT raise RuntimeError
+                result = await fetch_data(None)
+
+        assert result == []
+
+    @pytest.mark.asyncio
+    async def test_internal_flags_stripped_from_stored_rows(self):
+        """Rows returned for storage carry no internal bookkeeping flags."""
+        mock_feed = self._make_feed(["Good Article"])
+
+        with patch("feedparser.parse", return_value=mock_feed):
+            with patch("resources.headlines.process_entry", new_callable=AsyncMock) as mock_process:
+                mock_process.return_value = self._entry("good1")
+
+                result = await fetch_data(None)
+
+        assert len(result) == 1
+        row = result[0]
+        assert "_jina_failed" not in row
+        assert "_llm_failed" not in row
+        assert "_failure_reason" not in row

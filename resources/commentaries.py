@@ -130,14 +130,14 @@ async def extract_content(url: str) -> tuple[str, str]:
             text = await extract_via_docling(url)
             return "pdf", text
         except Exception as e:
-            click.echo(f"  → docling failed: {e}", err=True)
+            click.echo(f"commentaries:   → docling failed: {e}", err=True)
             return "pdf", ""
     else:
         try:
             text = await extract_via_jina(url)
             return "web", text
         except Exception as e:
-            click.echo(f"  → Jina failed: {e}", err=True)
+            click.echo(f"commentaries:   → Jina failed: {e}", err=True)
             return "web", ""
 
 
@@ -151,9 +151,9 @@ async def process_entry(entry: Dict) -> Optional[Dict]:
         pub_date = parse_pub_date(entry)
         record_id = get_hash_id([url])
 
-        click.echo(f"Processing: {title}")
+        click.echo(f"commentaries: processing: {title}")
         content_type, full_text = await extract_content(url)
-        click.echo(f"  → {content_type}, {len(full_text)} chars extracted")
+        click.echo(f"commentaries:   → {content_type}, {len(full_text)} chars extracted")
 
         return {
             "id": record_id,
@@ -167,13 +167,15 @@ async def process_entry(entry: Dict) -> Optional[Dict]:
             "imported_on": datetime.now().isoformat(),
         }
     except Exception as e:
-        click.echo(f"Error processing '{entry.get('title', 'Unknown')}': {e}", err=True)
+        click.echo(
+            f"commentaries: error processing '{entry.get('title', 'Unknown')}': {e}", err=True
+        )
         return None
 
 
 async def fetch_data(existing_table: Optional[Table]) -> List[Dict[str, Any]]:
     """Fetch commentaries from the SLW RSS feed."""
-    click.echo(f"Fetching commentaries from {COMMENTARIES_RSS}")
+    click.echo(f"commentaries: fetching commentaries from {COMMENTARIES_RSS}")
     feed = feedparser.parse(COMMENTARIES_RSS)
 
     existing_ids = set()
@@ -194,7 +196,7 @@ async def fetch_data(existing_table: Optional[Table]) -> List[Dict[str, Any]]:
         tasks.append(asyncio.create_task(process_entry(entry)))
 
     if skipped:
-        click.echo(f"Skipped {skipped} already-imported entries")
+        click.echo(f"commentaries: skipped {skipped} already-imported entries")
 
     results = await asyncio.gather(*tasks)
     valid = [r for r in results if r is not None]
@@ -202,12 +204,12 @@ async def fetch_data(existing_table: Optional[Table]) -> List[Dict[str, Any]]:
     empty_text = [r for r in valid if not r.get("full_text")]
     if valid and len(empty_text) > len(valid) * 0.5:
         click.echo(
-            f"⚠️  Text extraction failed for {len(empty_text)}/{len(valid)} entries — "
-            "check docling health and JINA_API_TOKEN",
+            f"commentaries: WARNING — text extraction failed for {len(empty_text)}/{len(valid)} "
+            "entries; check docling health and JINA_API_TOKEN",
             err=True,
         )
 
-    click.echo(f"Added {len(valid)} new commentaries")
+    click.echo(f"commentaries: added {len(valid)} new commentaries")
     return valid
 
 
@@ -234,13 +236,15 @@ def fetch_fragments_data(
             if desc:
                 frag_id = get_hash_id([record["id"], "0"])
                 if frag_id not in existing_ids:
-                    fragments.append({
-                        "id": frag_id,
-                        "commentary_id": record["id"],
-                        "fragment_index": 0,
-                        "text": desc,
-                        "char_count": len(desc),
-                    })
+                    fragments.append(
+                        {
+                            "id": frag_id,
+                            "commentary_id": record["id"],
+                            "fragment_index": 0,
+                            "text": desc,
+                            "char_count": len(desc),
+                        }
+                    )
             continue
 
         i = 0
@@ -250,15 +254,20 @@ def fetch_fragments_data(
             if chunk:
                 frag_id = get_hash_id([record["id"], str(idx)])
                 if frag_id not in existing_ids:
-                    fragments.append({
-                        "id": frag_id,
-                        "commentary_id": record["id"],
-                        "fragment_index": idx,
-                        "text": chunk,
-                        "char_count": len(chunk),
-                    })
+                    fragments.append(
+                        {
+                            "id": frag_id,
+                            "commentary_id": record["id"],
+                            "fragment_index": idx,
+                            "text": chunk,
+                            "char_count": len(chunk),
+                        }
+                    )
                 idx += 1
             i += FRAGMENT_SIZE - FRAGMENT_OVERLAP
 
-    click.echo(f"Created {len(fragments)} fragments from {len(main_data_context)} commentaries")
+    click.echo(
+        f"commentaries: created {len(fragments)} fragments "
+        f"from {len(main_data_context)} commentaries"
+    )
     return fragments
