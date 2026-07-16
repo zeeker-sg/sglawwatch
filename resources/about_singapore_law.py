@@ -9,7 +9,6 @@ Tables created:
 """
 
 import hashlib
-import os
 import time
 from typing import Any, Dict, List, Optional
 
@@ -17,30 +16,27 @@ import click
 import httpx
 from bs4 import BeautifulSoup
 from sqlite_utils.db import Table
+from zeeker import Skip
 
-# Zeeker calls fetch_data twice for fragment resources (second call builds main_data_context
-# for fetch_fragments_data). The second call passes existing_table=None, so the dedup check
-# sees an empty set and returns all chapters again, causing duplicate rows. This sentinel
-# detects the second call and short-circuits it. Same pattern as zeeker-judgements.
-_RAN_PID_KEY = "_ABOUT_SG_LAW_MAIN_RAN_PID"
+# zeeker >= 0.9.0 runs fetch_data ONCE per build and threads its output to
+# fetch_fragments_data as main_data_context — no module reload, no second
+# call. The old PID-sentinel guard against double invocation is gone.
 
 
 def fetch_data(existing_table: Optional[Table]) -> List[Dict[str, Any]]:
     """Discover all legal chapters from multiple Singapore Law Watch sections."""
-
-    current_pid = str(os.getpid())
-    if os.environ.get(_RAN_PID_KEY) == current_pid:
-        return []
-    os.environ[_RAN_PID_KEY] = current_pid
 
     existing_urls = set()
     if existing_table:
         existing_urls = {row["item_url"] for row in existing_table.rows}
 
     all_items = []
+    sections = get_home_page_urls()
+    failed_sections = 0
+    last_error: Optional[Exception] = None
 
     # Process each home page
-    for home_url, home_name in get_home_page_urls():
+    for home_url, home_name in sections:
         try:
             # Each "home page" is actually a section with direct chapter links
             chapter_links = discover_chapter_links(home_url, home_name)
@@ -55,12 +51,24 @@ def fetch_data(existing_table: Optional[Table]) -> List[Dict[str, Any]]:
             time.sleep(1)  # Be respectful
 
         except Exception as e:
+            failed_sections += 1
+            last_error = e
             click.echo(
                 f"about_singapore_law: failed to process section {home_url}: "
                 f"{type(e).__name__}: {e}",
                 err=True,
             )
             continue
+
+    # Every section fetch failed — the source was never actually checked
+    # (proxy down, network outage). Raise a blocked Skip so the build status
+    # says so and the _zeeker_updates freshness marker does NOT advance.
+    # A clean crawl that simply found nothing new still returns [].
+    if failed_sections == len(sections) and not all_items and last_error is not None:
+        raise Skip(
+            f"discovery failed (proxy?): {type(last_error).__name__}: {last_error}",
+            kind="blocked",
+        )
 
     return all_items
 
@@ -158,52 +166,47 @@ def get_home_page_urls() -> List[tuple[str, str]]:
 
 
 def discover_chapter_links(section_url: str, section_name: str) -> List[Dict[str, Any]]:
-    """Find all chapter links within a section page."""
+    """Find all chapter links within a section page.
 
-    try:
-        response = httpx.get(section_url, timeout=30.0)
-        response.raise_for_status()
-        soup = BeautifulSoup(response.content, "html.parser")
+    Raises on fetch/parse failure — fetch_data counts section failures so it
+    can tell "every section unreachable" (blocked Skip) from "nothing new".
+    """
 
-        # Find all chapter links using the main wrapper selector
-        main_wrapper = soup.select(".edn_mainWrapper")
-        chapter_links = []
+    response = httpx.get(section_url, timeout=30.0)
+    response.raise_for_status()
+    soup = BeautifulSoup(response.content, "html.parser")
 
-        if main_wrapper:
-            links = main_wrapper[0].select("a")  # Use first main wrapper
-            for link in links:
-                href = link.get("href")
-                title = link.get_text(strip=True)
+    # Find all chapter links using the main wrapper selector
+    main_wrapper = soup.select(".edn_mainWrapper")
+    chapter_links = []
 
-                # Only include links that go deeper into About-Singapore-Law and have meaningful text
-                if (
-                    href
-                    and "About-Singapore-Law" in href
-                    and href != section_url  # Not the same page
-                    and len(title) > 5
-                ):  # Has meaningful title
-                    url_hash = hashlib.md5(href.encode()).hexdigest()[:12]
-                    chapter_links.append(
-                        {
-                            "id": url_hash,
-                            "item_url": href,
-                            "title": title,
-                            "section": section_name,
-                            "home_page": section_name,
-                            "last_scraped": time.strftime("%Y-%m-%d %H:%M:%S"),
-                            "content_length": 0,
-                        }
-                    )
+    if main_wrapper:
+        links = main_wrapper[0].select("a")  # Use first main wrapper
+        for link in links:
+            href = link.get("href")
+            title = link.get_text(strip=True)
 
-        return chapter_links
+            # Only include links that go deeper into About-Singapore-Law and have meaningful text
+            if (
+                href
+                and "About-Singapore-Law" in href
+                and href != section_url  # Not the same page
+                and len(title) > 5
+            ):  # Has meaningful title
+                url_hash = hashlib.md5(href.encode()).hexdigest()[:12]
+                chapter_links.append(
+                    {
+                        "id": url_hash,
+                        "item_url": href,
+                        "title": title,
+                        "section": section_name,
+                        "home_page": section_name,
+                        "last_scraped": time.strftime("%Y-%m-%d %H:%M:%S"),
+                        "content_length": 0,
+                    }
+                )
 
-    except Exception as e:
-        click.echo(
-            f"about_singapore_law: failed to discover chapters from {section_url}: "
-            f"{type(e).__name__}: {e}",
-            err=True,
-        )
-        return []
+    return chapter_links
 
 
 def scrape_chapter_content(chapter_url: str) -> list[dict]:
