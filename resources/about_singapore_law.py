@@ -165,6 +165,19 @@ def get_home_page_urls() -> List[tuple[str, str]]:
     ]
 
 
+def normalise_chapter_url(href: Optional[str]) -> Optional[str]:
+    """Canonicalise SLW chapter links to https.
+
+    Since 2026-08 section pages emit http:// links (which 301 to https). The
+    chapter id is a hash of the href and fetch_data dedups on item_url, so a
+    scheme flip would otherwise re-insert every chapter under a new id.
+    """
+    prefix = "http://www.singaporelawwatch.sg/"
+    if href and href.startswith(prefix):
+        return "https://www.singaporelawwatch.sg/" + href[len(prefix) :]
+    return href
+
+
 def discover_chapter_links(section_url: str, section_name: str) -> List[Dict[str, Any]]:
     """Find all chapter links within a section page.
 
@@ -183,7 +196,7 @@ def discover_chapter_links(section_url: str, section_name: str) -> List[Dict[str
     if main_wrapper:
         links = main_wrapper[0].select("a")  # Use first main wrapper
         for link in links:
-            href = link.get("href")
+            href = normalise_chapter_url(link.get("href"))
             title = link.get_text(strip=True)
 
             # Only include links that go deeper into About-Singapore-Law and have meaningful text
