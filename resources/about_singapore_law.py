@@ -77,25 +77,48 @@ def fetch_fragments_data(
     existing_fragments_table: Optional[Table],
     main_data_context: Optional[List[Dict[str, Any]]] = None,
 ) -> List[Dict[str, Any]]:
-    """Create content fragments from each chapter."""
+    """Create content fragments from each chapter.
 
-    if not main_data_context:
-        return []
+    Besides the chapters discovered in this build, every build retries stored
+    chapters that still have no fragments (``fragments_on_skip = true`` in
+    zeeker.toml runs this phase on up-to-date builds too). That heals chapters
+    whose scrape failed or produced nothing at ingest.
+    """
+    global __zeeker_report__
 
     existing_fragment_ids = set()
     if existing_fragments_table:
         existing_fragment_ids = {row["id"] for row in existing_fragments_table.rows}
 
+    chapters = list(main_data_context or [])
+    backfill = find_chapters_without_fragments(existing_fragments_table, chapters)
+    if backfill:
+        click.echo(
+            f"about_singapore_law: backfill: retrying {len(backfill)} stored chapters "
+            "with no fragments"
+        )
+    chapters.extend(backfill)
+    if not chapters:
+        return []
+
     all_fragments = []
     scraped_count = 0
     failed_count = 0
     skipped_count = 0
+    alias_count = 0
+    backfill_ids = {c["id"] for c in backfill}
+    backfilled_count = 0
 
-    for chapter in main_data_context:
+    for chapter in chapters:
         chapter_url = chapter.get("item_url", "")
         try:
             # Scrape chapter content — raises on fetch/parse failure
             paragraphs = scrape_chapter_content(chapter_url)
+        except AliasChapter as e:
+            alias_count += 1
+            click.echo(f"about_singapore_law: skipping alias chapter: {e}", err=True)
+            time.sleep(1)  # Be respectful
+            continue
         except Exception as e:
             failed_count += 1
             click.echo(
@@ -124,6 +147,8 @@ def fetch_fragments_data(
 
         all_fragments.extend(new_fragments)
         scraped_count += 1
+        if chapter["id"] in backfill_ids and new_fragments:
+            backfilled_count += 1
         click.echo(
             f"about_singapore_law: created {len(new_fragments)} fragments from {chapter_url}"
         )
@@ -132,10 +157,44 @@ def fetch_fragments_data(
 
     click.echo(
         f"about_singapore_law: done — {scraped_count} chapters scraped, "
-        f"{failed_count} failed, {skipped_count} skipped"
+        f"{failed_count} failed, {skipped_count} skipped, {alias_count} aliases"
     )
+    if backfill:
+        __zeeker_report__ = {
+            "backfill_candidates": len(backfill),
+            "backfilled": backfilled_count,
+            "skipped_alias": alias_count,
+        }
 
     return all_fragments
+
+
+def find_chapters_without_fragments(
+    existing_fragments_table: Optional[Table],
+    already_queued: List[Dict[str, Any]],
+) -> List[Dict[str, Any]]:
+    """Stored chapters with no fragments, to retry this build.
+
+    Skips http:// rows: they are leftovers from before links were canonicalised
+    to https, and each has an https twin that is retried instead.
+    """
+    db = getattr(existing_fragments_table, "db", None)
+    if db is None or not db["about_singapore_law"].exists():
+        return []
+    queued = {c.get("id") for c in already_queued}
+    sql = """
+        SELECT a.id, a.item_url FROM about_singapore_law a
+        WHERE a.item_url NOT LIKE 'http://%'
+          AND NOT EXISTS (
+            SELECT 1 FROM about_singapore_law_fragments f WHERE f.item_id = a.id
+          )
+        ORDER BY a.rowid
+    """
+    return [
+        {"id": row[0], "item_url": row[1]}
+        for row in db.execute(sql).fetchall()
+        if row[0] not in queued
+    ]
 
 
 def transform_data(raw_data: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
@@ -165,6 +224,19 @@ def get_home_page_urls() -> List[tuple[str, str]]:
     ]
 
 
+def normalise_chapter_url(href: Optional[str]) -> Optional[str]:
+    """Canonicalise SLW chapter links to https.
+
+    Since 2026-08 section pages emit http:// links (which 301 to https). The
+    chapter id is a hash of the href and fetch_data dedups on item_url, so a
+    scheme flip would otherwise re-insert every chapter under a new id.
+    """
+    prefix = "http://www.singaporelawwatch.sg/"
+    if href and href.startswith(prefix):
+        return "https://www.singaporelawwatch.sg/" + href[len(prefix) :]
+    return href
+
+
 def discover_chapter_links(section_url: str, section_name: str) -> List[Dict[str, Any]]:
     """Find all chapter links within a section page.
 
@@ -172,7 +244,7 @@ def discover_chapter_links(section_url: str, section_name: str) -> List[Dict[str
     can tell "every section unreachable" (blocked Skip) from "nothing new".
     """
 
-    response = httpx.get(section_url, timeout=30.0)
+    response = httpx.get(section_url, timeout=30.0, follow_redirects=True)
     response.raise_for_status()
     soup = BeautifulSoup(response.content, "html.parser")
 
@@ -183,7 +255,7 @@ def discover_chapter_links(section_url: str, section_name: str) -> List[Dict[str
     if main_wrapper:
         links = main_wrapper[0].select("a")  # Use first main wrapper
         for link in links:
-            href = link.get("href")
+            href = normalise_chapter_url(link.get("href"))
             title = link.get_text(strip=True)
 
             # Only include links that go deeper into About-Singapore-Law and have meaningful text
@@ -209,15 +281,30 @@ def discover_chapter_links(section_url: str, section_name: str) -> List[Dict[str
     return chapter_links
 
 
+class AliasChapter(Exception):
+    """The chapter URL redirects to a different chapter page.
+
+    The site has issued alias slugs such as ``ch-25-shipping-law-9`` that 301
+    to an existing canonical chapter. Fragmenting them would duplicate that
+    chapter's text under another id, so callers skip them.
+    """
+
+
 def scrape_chapter_content(chapter_url: str) -> list[dict]:
     """Extract main content from a chapter page, processing all content tags in order.
 
     Raises on fetch/parse failure — callers decide how to report and skip.
+    Raises AliasChapter when a redirect lands on a different chapter path
+    (an http -> https redirect keeps the path and is fine).
     Returns an empty list when the page yields no usable content.
     """
 
-    response = httpx.get(chapter_url, timeout=30.0)
+    response = httpx.get(chapter_url, timeout=30.0, follow_redirects=True)
     response.raise_for_status()
+    requested_path = httpx.URL(chapter_url).path.rstrip("/").lower()
+    final_path = response.url.path.rstrip("/").lower()
+    if final_path != requested_path:
+        raise AliasChapter(f"{chapter_url} redirects to {response.url}")
     soup = BeautifulSoup(response.content, "html.parser")
 
     article = soup.select(".edn_article")[0]
@@ -313,6 +400,11 @@ def extract_list_text(list_element) -> str:
     return "\n".join(items)
 
 
+# Numbered paragraphs like "1.1.1", "1.2.15" or "8A.1.1" (Ch. 08A numbers its
+# paragraphs with the chapter's letter suffix).
+NUMBERED_PARA_PATTERN = r"^(\d+[A-Z]?\.\d+\.\d+)"
+
+
 def create_content_fragments(
     content_parts: List[Dict[str, Any]], chapter_id: str
 ) -> List[Dict[str, Any]]:
@@ -322,12 +414,50 @@ def create_content_fragments(
     - Headings: Join to the NEXT numbered paragraph
     - Tables/Lists: Join to the PREVIOUS numbered paragraph/fragment
     - Indented paragraphs: Join to the PREVIOUS fragment
-    - Each fragment starts with a numbered paragraph (like 1.1.1)
+    - Each fragment starts with a numbered paragraph (like 1.1.1 or 8A.1.1)
+
+    Pages with no numbered paragraphs at all (the Singapore Legal System pages
+    are plain prose) fall back to anchoring on every regular paragraph, with
+    fragment ids ``{chapter_id}_p000``, ``_p001``, ... The fallback only applies
+    when there is no numbered paragraph, so numbered chapters keep their ids.
     """
 
     if not content_parts:
         return []
 
+    fragments = _build_fragments(content_parts, chapter_id, anchor_every_paragraph=False)
+    if not fragments:
+        prose = [p for p in content_parts if not _is_page_chrome(p)]
+        fragments = _build_fragments(prose, chapter_id, anchor_every_paragraph=True)
+    return fragments
+
+
+def _is_page_chrome(content_part: Dict[str, Any]) -> bool:
+    """Navigation left on short unnumbered pages, which filter_footer_content misses.
+
+    filter_footer_content only looks past the tenth element, so on a five-part
+    page the "Print" button, the view counter and the prev/next links survive.
+    """
+    text = content_part["text"].strip()
+    if text.lower() == "print" or text.isdigit():
+        return True
+    if content_part["type"] != "paragraph":
+        return False
+    # Prev/next navigation: a paragraph whose text is nothing but link text
+    soup = BeautifulSoup(content_part.get("original_text") or "", "html.parser")
+    links = soup.find_all("a")
+    if not links:
+        return False
+
+    def squash(value: str) -> str:
+        return "".join(value.split())
+
+    return squash("".join(a.get_text() for a in links)) == squash(soup.get_text())
+
+
+def _build_fragments(
+    content_parts: List[Dict[str, Any]], chapter_id: str, anchor_every_paragraph: bool
+) -> List[Dict[str, Any]]:
     import re
 
     fragments = []
@@ -335,8 +465,20 @@ def create_content_fragments(
     fragment_index = 0
     last_content_type = None  # Track the type of the previous content element
 
-    # Regex to match numbered paragraphs like "1.1.1", "1.2.15", etc.
-    numbered_para_pattern = r"^\d+\.\d+\.\d+"
+    def _start_fragment(content_text: str, section_num: str) -> None:
+        nonlocal current_headers, fragment_index
+        fragment_content = "\n\n".join(current_headers + [content_text])
+        fragments.append(
+            {
+                "id": f"{chapter_id}_{section_num}",
+                "item_id": chapter_id,
+                "fragment_order": fragment_index,
+                "content_text": fragment_content,
+                "char_count": len(fragment_content),
+            }
+        )
+        current_headers = []
+        fragment_index += 1
 
     for i, content_part in enumerate(content_parts):
         content_text = content_part["text"].strip()
@@ -347,29 +489,10 @@ def create_content_fragments(
             continue
 
         # Check if this is a numbered paragraph
-        if content_type == "paragraph" and re.match(numbered_para_pattern, content_text):
+        section_match = re.match(NUMBERED_PARA_PATTERN, content_text)
+        if content_type == "paragraph" and section_match and not anchor_every_paragraph:
             # Start new fragment with any collected headers + this numbered paragraph
-            fragment_content_parts = current_headers + [content_text]
-            fragment_content = "\n\n".join(fragment_content_parts)
-
-            # Extract the section number for the fragment ID
-            section_match = re.match(r"^(\d+\.\d+\.\d+)", content_text)
-            section_num = section_match.group(1) if section_match else f"f{fragment_index:03d}"
-            fragment_id = f"{chapter_id}_{section_num}"
-
-            fragments.append(
-                {
-                    "id": fragment_id,
-                    "item_id": chapter_id,
-                    "fragment_order": fragment_index,
-                    "content_text": fragment_content,
-                    "char_count": len(fragment_content),
-                }
-            )
-
-            # Reset for next fragment
-            current_headers = []
-            fragment_index += 1
+            _start_fragment(content_text, section_match.group(1))
 
         elif content_type == "heading":
             # Headings get collected for the NEXT numbered paragraph
@@ -399,6 +522,9 @@ def create_content_fragments(
                 last_fragment = fragments[-1]
                 last_fragment["content_text"] += "\n\n" + content_text
                 last_fragment["char_count"] = len(last_fragment["content_text"])
+            elif anchor_every_paragraph:
+                # Unnumbered page: every regular paragraph starts a fragment
+                _start_fragment(content_text, f"p{fragment_index:03d}")
             else:
                 # This is a regular paragraph - collect it as header for the next numbered paragraph
                 current_headers.append(content_text)

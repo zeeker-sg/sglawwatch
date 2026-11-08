@@ -216,10 +216,6 @@ def test_is_pdf_detection():
     assert not commentaries.is_pdf("https://x.test/pdf/page")
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason="Real bug (not fixed here): fetch_data only dedups against the table, not within a batch.",
-)
 async def test_duplicate_links_within_one_feed_are_collapsed(patch_feedparser, mock_async_http):
     """The live feed repeats some links; ids are link hashes, so rows must not collide.
 

@@ -19,6 +19,7 @@ OVERVIEW = "https://www.singaporelawwatch.sg/About-Singapore-Law/Overview"
 CH1 = (
     "http://www.singaporelawwatch.sg/About-Singapore-Law/Overview/ch-01-the-singapore-legal-system"
 )
+CH1_HTTPS = CH1.replace("http://", "https://", 1)
 EMPTY_SECTION = b'<html><body><div class="edn_mainWrapper"></div></body></html>'
 
 
@@ -52,8 +53,9 @@ def test_discover_chapter_links_parses_section_page(site):
     ]
     first = links[0]
     assert set(first) == CHAPTER_COLUMNS
-    assert first["id"] == hashlib.md5(CH1.encode()).hexdigest()[:12]
-    assert first["item_url"] == CH1
+    # the section page emits http:// links; they are canonicalised to https before hashing
+    assert first["id"] == hashlib.md5(CH1_HTTPS.encode()).hexdigest()[:12]
+    assert first["item_url"] == CH1_HTTPS
     assert first["section"] == first["home_page"] == "Overview"
     assert first["content_length"] == 0
     assert re.fullmatch(r"\d{4}-\d\d-\d\d \d\d:\d\d:\d\d", first["last_scraped"])
@@ -70,6 +72,24 @@ def test_fetch_data_discovers_across_sections_and_filters_known(site):
         rows = [{"item_url": known_url}]
 
     assert len(asl.fetch_data(Known())) == 3
+
+
+def test_http_links_match_rows_stored_under_https(site):
+    """Production stores https chapter URLs; http links on the page must not re-add them."""
+
+    class Stored:
+        rows = [{"item_url": CH1_HTTPS}]
+
+    urls = [r["item_url"] for r in asl.fetch_data(Stored())]
+    assert len(urls) == 3 and CH1_HTTPS not in urls
+    assert all(u.startswith("https://") for u in urls)
+
+
+def test_normalise_chapter_url_leaves_other_urls_alone():
+    assert asl.normalise_chapter_url(CH1) == CH1_HTTPS
+    assert asl.normalise_chapter_url(CH1_HTTPS) == CH1_HTTPS
+    assert asl.normalise_chapter_url("/About-Singapore-Law/x") == "/About-Singapore-Law/x"
+    assert asl.normalise_chapter_url(None) is None
 
 
 def test_section_http_error_is_counted_and_all_failing_is_a_blocked_skip(mock_sync_http):
@@ -119,14 +139,6 @@ def test_scrape_chapter_content_without_article_raises(mock_sync_http):
         asl.scrape_chapter_content("https://www.singaporelawwatch.sg/x")
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason=(
-        "Real bug (not fixed here): section pages emit http:// chapter links and the live site "
-        "answers them with 301 -> https; httpx.get does not follow redirects, so every chapter "
-        "scrape fails with HTTPStatusError. Remove this marker once follow_redirects is enabled."
-    ),
-)
 def test_http_chapter_url_that_redirects_to_https_can_be_scraped(fixture_bytes, mock_sync_http):
     def handler(request):
         if request.url.scheme == "http":
