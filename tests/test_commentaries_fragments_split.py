@@ -32,13 +32,15 @@ def test_constants_match_zeeker_toml_documentation():
     "length, expected",
     [
         (1, 1),
-        (1200, 2),  # tail window (from 1050) is pure overlap: fully contained in window 0
         (1050, 1),
-        (1051, 2),
-        (2250, 3),
+        (1051, 1),  # a tail window from 1050 would sit wholly inside window 0
+        (1200, 1),
+        (1201, 2),
+        (2250, 2),
+        (2251, 3),
         (3000, 3),
-        (3150, 3),
-        (3151, 4),
+        (3300, 3),
+        (3301, 4),
     ],
 )
 def test_fragment_count(length, expected):

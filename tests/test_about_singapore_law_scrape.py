@@ -119,14 +119,6 @@ def test_scrape_chapter_content_without_article_raises(mock_sync_http):
         asl.scrape_chapter_content("https://www.singaporelawwatch.sg/x")
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason=(
-        "Real bug (not fixed here): section pages emit http:// chapter links and the live site "
-        "answers them with 301 -> https; httpx.get does not follow redirects, so every chapter "
-        "scrape fails with HTTPStatusError. Remove this marker once follow_redirects is enabled."
-    ),
-)
 def test_http_chapter_url_that_redirects_to_https_can_be_scraped(fixture_bytes, mock_sync_http):
     def handler(request):
         if request.url.scheme == "http":

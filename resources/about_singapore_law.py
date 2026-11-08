@@ -172,7 +172,7 @@ def discover_chapter_links(section_url: str, section_name: str) -> List[Dict[str
     can tell "every section unreachable" (blocked Skip) from "nothing new".
     """
 
-    response = httpx.get(section_url, timeout=30.0)
+    response = httpx.get(section_url, timeout=30.0, follow_redirects=True)
     response.raise_for_status()
     soup = BeautifulSoup(response.content, "html.parser")
 
@@ -216,7 +216,7 @@ def scrape_chapter_content(chapter_url: str) -> list[dict]:
     Returns an empty list when the page yields no usable content.
     """
 
-    response = httpx.get(chapter_url, timeout=30.0)
+    response = httpx.get(chapter_url, timeout=30.0, follow_redirects=True)
     response.raise_for_status()
     soup = BeautifulSoup(response.content, "html.parser")
 
