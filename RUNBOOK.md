@@ -235,7 +235,19 @@ ever stored with placeholder text or placeholder summaries.
    new chapters → `no data returned` (`up_to_date`) — the normal case, since
    chapters are rarely added.
 3. Fragments phase scrapes each new chapter page and splits it into fragments
-   anchored on numbered paragraphs (e.g. `1.1.1`).
+   anchored on numbered paragraphs (e.g. `1.1.1`, `8A.1.1`). Pages with no
+   numbered paragraphs (the Singapore Legal System pages) are anchored on
+   every prose paragraph instead, with ids `<chapter>_p000`, `_p001`, ...
+4. **Backfill pass** — `fragments_on_skip = true`, so the fragments phase also
+   runs on up-to-date builds. Every build retries stored `https://` chapters
+   that still have no fragments and logs `about_singapore_law: backfill:
+   retrying N stored chapters`. Counters on the status line:
+   `backfill_candidates`, `backfilled`, `skipped_alias`. An **alias** is a
+   chapter URL that 301s to a different chapter (e.g. `ch-25-shipping-law-9`
+   → `Ch-17-...`); it is never fragmented. A steady `skipped_alias=N` means N
+   alias rows are still in the table; delete them to stop the retries.
+   Chapter links are canonicalised to `https://` before hashing, so the
+   site's `http://` links match the stored rows.
 
 Note (zeeker >= 0.9.0): `fetch_data()` runs ONCE per build; its output is
 threaded to `fetch_fragments_data()` as `main_data_context` with no module
@@ -304,9 +316,10 @@ WHERE summary IS NULL OR summary = '' OR summary = 'None';
 -- Commentaries with no extracted text (docling/Jina failures; no auto-heal)
 SELECT COUNT(*) FROM commentaries WHERE full_text IS NULL OR full_text = '';
 
--- Chapters with no fragments (fragment scrape failed at ingest)
+-- Chapters with no fragments (retried every build; what's left should be
+-- alias rows only, which the build log reports as skipped_alias)
 SELECT COUNT(*) FROM about_singapore_law a
-WHERE NOT EXISTS (
+WHERE a.item_url NOT LIKE 'http://%' AND NOT EXISTS (
   SELECT 1 FROM about_singapore_law_fragments f WHERE f.item_id = a.id
 );
 

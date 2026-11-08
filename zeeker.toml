@@ -32,6 +32,9 @@ description = "Catalog of 'About Singapore Law' reference chapters — academic 
 label_column = "title"
 facets = ["section"]
 fragments = true
+# Run the fragments phase on up-to-date builds too, so stored chapters with no
+# fragments are retried (see fetch_fragments_data).
+fragments_on_skip = true
 fts_fields = ["title"]
 fragments_fts_fields = ["content_text"]
 

@@ -178,10 +178,10 @@ def get_hash_id(elements: list[str], delimiter: str = "|") -> str:
 
     Examples:
         >>> get_hash_id(["2025-05-16", "Meeting Notes"])
-        '1a2b3c4d5e6f7g8h9i0j'
+        'e29e4d655563ceb0580bbb9e99dcf478'
 
         >>> get_hash_id(["user123", "login", "192.168.1.1"], delimiter=":")
-        '7h8i9j0k1l2m3n4o5p6q'
+        'a67a961db090699f136adda0c27f1a8b'
     """
     import hashlib
 

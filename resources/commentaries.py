@@ -193,6 +193,9 @@ async def fetch_data(existing_table: Optional[Table]) -> List[Dict[str, Any]]:
         if record_id in existing_ids:
             skipped += 1
             continue
+        # The live feed repeats some links; ids are link hashes, so keep the
+        # first occurrence only or one batch would hold duplicate primary keys.
+        existing_ids.add(record_id)
         tasks.append(asyncio.create_task(process_entry(entry)))
 
     if skipped:
@@ -264,6 +267,8 @@ def fetch_fragments_data(
                         }
                     )
                 idx += 1
+            if i + FRAGMENT_SIZE >= len(full_text):
+                break  # this window reached the end; another would sit wholly inside it
             i += FRAGMENT_SIZE - FRAGMENT_OVERLAP
 
     click.echo(
