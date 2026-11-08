@@ -11,6 +11,12 @@ jobs:
     name: Test
     runs-on: ubuntu-latest
     timeout-minutes: 10
+    env:
+      # Pin Python instead of using the runner's system interpreter. The
+      # ubuntu-latest image moved to 3.14, which pyo3-based deps (built
+      # from source by maturin) don't support yet. 3.12 matches
+      # sync-headlines.yml and requires-python.
+      UV_PYTHON: "3.12"
 
     steps:
       - name: Checkout repository
