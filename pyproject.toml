@@ -30,3 +30,13 @@ target-version = "py312"
 select = ["E", "F", "W", "I"]  # Focus on essential errors, warnings, and imports
 ignore = ["E501"]  # Line too long (handled by black)
 
+
+[tool.pytest.ini_options]
+pythonpath = ["."]
+asyncio_mode = "auto"
+# "live" tests need real network access or credentials. CI never runs them;
+# opt in locally with: uv run pytest -m live
+addopts = "-m 'not live'"
+markers = [
+    "live: needs real network access or credentials (excluded by default)",
+]
